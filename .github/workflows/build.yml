@@ -1,0 +1,101 @@
+name: Android Static Build ipset
+
+on:
+  workflow_dispatch:
+    inputs:
+      target_arch:
+        description: 'Target architecture (aarch64/arm/x86_64/i686)'
+        required: false
+        default: 'aarch64'
+      ndk_version:
+        description: 'Android NDK version'
+        required: false
+        default: 'r27c'
+      android_api:
+        description: 'Android API level'
+        required: false
+        default: '30'
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Android NDK
+      uses: nttld/setup-ndk@v1
+      with:
+        ndk-version: ${{ github.event.inputs.ndk_version || 'r27c' }}
+
+    - name: Install dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install -y git automake libtool gcc perl
+
+    - name: Clone ipset and libmnl
+      run: |
+        git clone https://git.netfilter.org/ipset.git
+        git clone https://git.netfilter.org/libmnl.git
+
+    - name: Set build parameters
+      id: vars
+      run: |
+        case "${{ github.event.inputs.target_arch || 'aarch64' }}" in
+          aarch64) target="aarch64-linux-android" ;;
+          arm) target="armv7a-linux-androideabi" ;;
+          x86_64) target="x86_64-linux-android" ;;
+          i686) target="i686-linux-android" ;;
+          *) echo "Unsupported architecture"; exit 1 ;;
+        esac
+        echo "target=$target" >> $GITHUB_OUTPUT
+        echo "api=${{ github.event.inputs.android_api || '30' }}" >> $GITHUB_OUTPUT
+
+    - name: Build libmnl
+      run: |
+        cd libmnl
+        export NDK_TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+        export TARGET=${{ steps.vars.outputs.target }}
+        export API=${{ steps.vars.outputs.api }}
+        
+        ./autogen.sh
+        ./configure \
+          --host=$TARGET \
+          --enable-static \
+          --disable-shared \
+          CC="$NDK_TOOLCHAIN/clang --target=$TARGET$API" \
+          AR=$NDK_TOOLCHAIN/llvm-ar \
+          RANLIB=$NDK_TOOLCHAIN/llvm-ranlib
+        
+        make -j$(nproc)
+        sudo make install DESTDIR=/data/sysroot
+
+    - name: Build ipset
+      run: |
+        cd ipset
+        export NDK_TOOLCHAIN=$ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin
+        export TARGET=${{ steps.vars.outputs.target }}
+        export API=${{ steps.vars.outputs.api }}
+        
+        ./autogen.sh
+        
+        ./configure \
+          --host=$TARGET \
+          --disable-shared \
+          --enable-static \
+          --with-kmod=no \
+          CC="$NDK_TOOLCHAIN/clang --target=$TARGET$API" \
+          AR=$NDK_TOOLCHAIN/llvm-ar \
+          RANLIB=$NDK_TOOLCHAIN/llvm-ranlib \
+          CFLAGS="-I/data/sysroot/usr/local/include" \
+          LDFLAGS="-L/data/sysroot/usr/local/lib -static"
+        
+        make -j$(nproc)
+        sudo make install DESTDIR=/data/sysroot
+        
+        sudo find /data/sysroot -type f \( -executable -o -name "*.a" \) -exec $NDK_TOOLCHAIN/llvm-strip --strip-all {} \;
+
+    - name: Upload artifacts
+      uses: actions/upload-artifact@v4.3.1
+      with:
+        name: android-${{ github.event.inputs.target_arch || 'aarch64' }}-ipset-static
+        path: /data/sysroot/usr/local/sbin/ipset
